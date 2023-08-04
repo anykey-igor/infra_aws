@@ -1,0 +1,116 @@
+stages:
+  - init
+  - validate
+  - plan
+  - apply
+  - destroy
+
+image:
+  name: ianikeiev/terraformaws:latest
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+cache:
+  paths:
+    - .terraform
+    - .terraform.lock.hcl
+
+variables:
+  ROLE_ARN: arn:aws:iam::$ACCOUNT_ID:role/terraform_sa
+  PLAN_JSON: plan.json
+
+before_script:
+  - >
+    export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+    $(aws sts assume-role-with-web-identity
+    --role-arn ${ROLE_ARN}
+    --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+    --web-identity-token $CI_JOB_JWT_V2
+    --duration-seconds 3600
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+    --output text))
+  - aws sts get-caller-identity
+  - terraform --version
+
+
+init:
+  tags:
+    - docker
+  stage: init
+  environment: dev
+  script:
+    - rm -rf .terraform
+    - terraform init
+
+
+validate:
+  tags:
+    - docker
+  stage: validate
+  environment: dev
+  needs:
+    - job: init
+  dependencies:
+    - init
+  script:
+    - terraform validate
+
+
+plan:
+  tags:
+    - docker
+  stage: plan
+  environment: dev
+  needs:
+    - job: validate
+  dependencies:
+    - validate
+  script:
+    - apt-get install jq
+    - shopt -s expand_aliases
+    - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+    - export TF_VAR_environment=$CI_ENVIRONMENT_NAME
+    - terraform plan -out "terraform.tfplan"
+    - terraform show --json "terraform.tfplan" | convert_report > $PLAN_JSON
+    - cat $PLAN_JSON
+  artifacts:
+    paths:
+      - terraform.tfplan
+      - $PLAN_JSON
+    reports:
+      terraform: $PLAN_JSON
+  allow_failure: false
+
+
+apply:
+  tags:
+    - docker
+  environment: dev
+  stage: apply
+  needs:
+    - job: plan
+  dependencies:
+    - plan
+  script:
+    - terraform apply --auto-approve -input=false "terraform.tfplan"
+  when: manual
+  only:
+    - main
+    - dev
+
+
+destroy:
+  tags:
+    - docker
+  environment: dev
+  stage: destroy
+  needs:
+    - plan
+    - apply
+  script:
+    -  terraform destroy --auto-approve
+  when: manual
+  only:
+    - main
+    - dev
